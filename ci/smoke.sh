@@ -10,6 +10,7 @@ python3 -m py_compile \
   "$ROOT_DIR/flash_moe_mlx/upstream_gated_delta.py" \
   "$ROOT_DIR/flash_moe_mlx/upstream_switch_layers.py" \
   "$ROOT_DIR/scripts/run_qwen35.py" \
+  "$ROOT_DIR/scripts/serve_openai.py" \
   "$ROOT_DIR/scripts/export_tiered_35b_2bit.py" \
   "$ROOT_DIR/scripts/export_mixed_sidecar.py" \
   "$ROOT_DIR/tools/diagnostics/bench_slot_bank_oracle_hits.py" \

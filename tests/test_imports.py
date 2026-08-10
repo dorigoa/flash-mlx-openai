@@ -11,11 +11,19 @@ if str(ROOT_DIR) not in sys.path:
 
 def main() -> int:
     import flash_moe_mlx
-    from scripts import run_qwen35
+    from scripts import run_qwen35, serve_openai
 
     assert hasattr(flash_moe_mlx, "load_model_bundle")
     parser = run_qwen35.build_arg_parser()
     assert parser.prog
+    assert serve_openai.build_arg_parser().prog
+
+    assembler = serve_openai.ResponseAssembler(stop_strings=["STOP"])
+    for char in "<think>why</think>\n\nhello STOP dropped":
+        assembler.push(char)
+    assert assembler.reasoning == "why", assembler.reasoning
+    assert assembler.content == "hello ", assembler.content
+    assert assembler.stopped
     print("import-ok")
     return 0
 

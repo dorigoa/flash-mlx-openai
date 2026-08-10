@@ -16,6 +16,9 @@ export = [
   "safetensors",
   "torch",
 ]
+server = [
+  "jinja2",
+]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

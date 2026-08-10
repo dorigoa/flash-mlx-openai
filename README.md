@@ -133,6 +133,56 @@ python3 scripts/run_qwen35.py \
 
 Expert size: 4-bit = 1.69 MB, UD-Q2 = 0.94 MB (44% smaller, 37% less SSD I/O)
 
+## OpenAI-compatible server
+
+`run_qwen35.py` loads, decodes one prompt, and exits. `serve_openai.py` is the same
+runtime with the same loading flags, kept resident in one process and driven over HTTP,
+so agents and open-webui can use it.
+
+```bash
+python3 scripts/serve_openai.py \
+  --mlx ~/Models/mlx-Qwen3.5-35B-A3B-4bit \
+  --experts ~/Models/packed_experts \
+  --slot-bank 64 --slot-bank-native --prefetch-temporal \
+  --cache-io-split 4 --k 4 \
+  --port 8080
+```
+
+Every model flag from `run_qwen35.py` works here (`--resident`, `--resident-pread-mlx`,
+`--slot-bank`, `--2-bit`, `--compiled-tail`, ...). Server-side flags: `--host`, `--port`,
+`--api-key`, `--served-model-name`, `--default-max-tokens`, `--max-tokens-cap`,
+`--temperature`, `--no-reasoning`, `--no-tool-calls`, `--verbose`.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /v1/models` | Model list, id defaults to the `--mlx` directory name |
+| `POST /v1/chat/completions` | Chat, streaming (SSE) and non-streaming |
+| `POST /v1/completions` | Legacy raw-prompt completion, no chat template |
+| `GET /health` | Liveness, busy flag, slot-bank hit rate |
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages": [{"role": "user", "content": "What is Apple Neural Engine?"}],
+       "max_tokens": 120, "stream": true}'
+```
+
+Any OpenAI client works by pointing `base_url` at `http://127.0.0.1:8080/v1`. In open-webui,
+add an OpenAI connection with that same URL (any non-empty API key unless you set `--api-key`).
+
+Details worth knowing:
+
+- Prompts are rendered with the checkpoint's own chat template when `jinja2` is installed,
+  otherwise with a plain ChatML fallback.
+- `<think>` blocks are split out into `reasoning_content` (`--no-reasoning` keeps them inline),
+  and Qwen `<tool_call>` blocks are parsed into OpenAI `tool_calls`.
+- One generation at a time: the model is a single resident MLX graph, so requests take the
+  generation slot in turn and wait up to `--busy-timeout` before a 503.
+- There is no cross-request KV cache: each request re-prefills its whole prompt one token at a
+  time, so long chat histories pay a growing prefill cost per turn.
+- The runtime sampler is temperature-only, so `top_p`, `top_k` and penalties are accepted and
+  ignored. Text-only: image content parts are rejected.
+
 ## How it works
 
 The repo has a small number of moving parts:
@@ -143,6 +193,7 @@ The repo has a small number of moving parts:
 | `flash_moe_mlx/expert_io.py` | Expert geometry, packed expert parsing, slot-bank |
 | `csrc/expert_io.c` | Native pread I/O with thread pool |
 | `scripts/run_qwen35.py` | Main inference entrypoint |
+| `scripts/serve_openai.py` | OpenAI-compatible HTTP server over the same runtime |
 | `scripts/export_mixed_sidecar.py` | Export experts preserving quantization |
 | `scripts/export_tiered_35b_2bit.py` | Convert tiered experts to uniform 2-bit |
 

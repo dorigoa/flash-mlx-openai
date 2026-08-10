@@ -1,0 +1,1241 @@
+#!/usr/bin/env python3
+"""OpenAI-compatible REST server for the flash-moe MLX runtime.
+
+Same runtime as ``run_qwen35.py`` - same flags for model/expert loading - but
+kept resident in one process and driven over HTTP instead of exiting after a
+single prompt. Enough of the OpenAI API is implemented for agents and
+open-webui to talk to it:
+
+    GET  /v1/models
+    GET  /v1/models/{id}
+    POST /v1/chat/completions   (stream and non-stream)
+    POST /v1/completions        (stream and non-stream)
+    GET  /health                (also /v1/health)
+
+Generation is single-threaded: one model, one process, requests serialized
+behind a lock. The HTTP layer stays threaded so /v1/models and /health answer
+while a generation is running.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import threading
+import time
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Callable, Iterator, Optional, Sequence
+
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from flash_moe_mlx import (  # noqa: E402
+    GenerationStats,
+    ModelBundle,
+    collect_slot_bank_stats,
+    decode_incremental,
+    generate_with_stats,
+    load_model_bundle,
+    set_sparse_moe_tail_compile,
+)
+
+
+MAX_BODY_BYTES = 32 * 1024 * 1024
+
+
+def _orange(text: str) -> str:
+    if not sys.stderr.isatty():
+        return text
+    return f"\033[38;5;208m{text}\033[0m"
+
+
+def _prefix() -> str:
+    return f"[{_orange('flash-moe-mlx')}]"
+
+
+def _log(message: str) -> None:
+    print(f"{_prefix()} {message}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# chat prompt rendering
+# ---------------------------------------------------------------------------
+
+
+class ChatPromptBuilder:
+    """Render OpenAI ``messages`` into a prompt string.
+
+    Uses the checkpoint's own Jinja chat template when jinja2 is installed,
+    and falls back to plain ChatML (which is what the Qwen templates emit
+    anyway for simple conversations).
+    """
+
+    def __init__(self, model_dir: Path, enable_thinking: Optional[bool] = None) -> None:
+        self.model_dir = Path(model_dir)
+        self.enable_thinking = enable_thinking
+        self.source = "chatml-fallback"
+        self._template = None
+        self._extra_vars: dict[str, Any] = {}
+        self._load()
+
+    def _load(self) -> None:
+        template_text = self._read_template_text()
+        if template_text is None:
+            return
+        try:
+            from jinja2 import Environment
+            from jinja2.sandbox import ImmutableSandboxedEnvironment
+        except ImportError:
+            _log("jinja2 not installed, using ChatML fallback template")
+            return
+
+        def raise_exception(message: str) -> None:
+            raise ValueError(message)
+
+        def strftime_now(fmt: str) -> str:
+            return time.strftime(fmt, time.localtime())
+
+        env: Environment = ImmutableSandboxedEnvironment(
+            trim_blocks=True, lstrip_blocks=True, keep_trailing_newline=True
+        )
+        env.globals["raise_exception"] = raise_exception
+        env.globals["strftime_now"] = strftime_now
+        self._template = env.from_string(template_text)
+        self.source = "checkpoint-template"
+
+    def _read_template_text(self) -> Optional[str]:
+        jinja_path = self.model_dir / "chat_template.jinja"
+        if jinja_path.is_file():
+            return jinja_path.read_text(encoding="utf-8")
+        config_path = self.model_dir / "tokenizer_config.json"
+        if not config_path.is_file():
+            return None
+        try:
+            with config_path.open("r", encoding="utf-8") as f:
+                config = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        for key in ("bos_token", "eos_token", "pad_token", "unk_token"):
+            value = config.get(key)
+            if isinstance(value, dict):
+                value = value.get("content")
+            if isinstance(value, str):
+                self._extra_vars[key] = value
+        template = config.get("chat_template")
+        if isinstance(template, list):  # named templates
+            named = {entry.get("name"): entry.get("template") for entry in template}
+            template = named.get("default") or next(iter(named.values()), None)
+        return template if isinstance(template, str) else None
+
+    def render(self, messages: Sequence[dict], tools: Optional[Sequence[dict]] = None) -> str:
+        normalized = [_normalize_message(m) for m in messages]
+        if self._template is None:
+            return _render_chatml(normalized)
+        kwargs: dict[str, Any] = dict(self._extra_vars)
+        kwargs.update(
+            messages=normalized,
+            tools=list(tools) if tools else None,
+            add_generation_prompt=True,
+        )
+        if self.enable_thinking is not None:
+            kwargs["enable_thinking"] = self.enable_thinking
+        try:
+            return self._template.render(**kwargs)
+        except Exception as exc:  # bad template, bad message shape
+            raise BadRequest(f"chat template rendering failed: {exc}") from exc
+
+
+def _normalize_message(message: Any) -> dict:
+    if not isinstance(message, dict):
+        raise BadRequest("each item of 'messages' must be an object")
+    role = message.get("role")
+    if not isinstance(role, str) or not role:
+        raise BadRequest("each message needs a string 'role'")
+    content = message.get("content")
+    if content is None:
+        text = ""
+    elif isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and part.get("type") in (None, "text"):
+                parts.append(str(part.get("text", "")))
+            else:
+                kind = part.get("type") if isinstance(part, dict) else type(part).__name__
+                raise BadRequest(f"unsupported content part '{kind}': this server is text-only")
+        text = "".join(parts)
+    else:
+        raise BadRequest("'content' must be a string or a list of content parts")
+    out = {"role": role, "content": text}
+    for key in ("name", "tool_calls", "tool_call_id", "reasoning_content"):
+        if message.get(key) is not None:
+            out[key] = message[key]
+    return out
+
+
+def _render_chatml(messages: Sequence[dict]) -> str:
+    chunks = []
+    for message in messages:
+        chunks.append(f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n")
+    chunks.append("<|im_start|>assistant\n")
+    return "".join(chunks)
+
+
+# ---------------------------------------------------------------------------
+# streamed text assembly: stop strings, <think> blocks, <tool_call> blocks
+# ---------------------------------------------------------------------------
+
+THINK_OPEN = "<think>"
+THINK_CLOSE = "</think>"
+TOOL_OPEN = "<tool_call>"
+TOOL_CLOSE = "</tool_call>"
+TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
+# Never emit these even if the checkpoint's eos list does not cover them.
+IMPLICIT_STOPS = ("<|im_end|>", "<|endoftext|>", "<|im_start|>")
+
+
+def _find_first_marker(buf: str, markers: Sequence[str]) -> tuple[int, str]:
+    best_index = -1
+    best_marker = ""
+    for marker in markers:
+        index = buf.find(marker)
+        if index >= 0 and (best_index < 0 or index < best_index):
+            best_index, best_marker = index, marker
+    return best_index, best_marker
+
+
+def _partial_tail_len(buf: str, markers: Sequence[str]) -> int:
+    """Length of the buffer suffix that could still grow into a marker."""
+    longest = max((len(m) for m in markers), default=0) - 1
+    for size in range(min(longest, len(buf)), 0, -1):
+        tail = buf[-size:]
+        if any(marker.startswith(tail) for marker in markers):
+            return size
+    return 0
+
+
+class ResponseAssembler:
+    """Turn raw decoded deltas into (reasoning, content) deltas.
+
+    Holds back the tail of the text while it could still be the start of a
+    stop string or of a ``<think>``/``<tool_call>`` marker, so markers never
+    leak into the streamed output.
+    """
+
+    def __init__(
+        self,
+        stop_strings: Sequence[str] = (),
+        parse_reasoning: bool = True,
+        parse_tool_calls: bool = True,
+    ) -> None:
+        self.stop_strings = [s for s in stop_strings if s]
+        self.parse_reasoning = parse_reasoning
+        self.parse_tool_calls = parse_tool_calls
+        self.stopped = False
+        self.raw = ""
+        self.reasoning = ""
+        self.content = ""
+        self._pending = ""
+        self._mode = "detect" if parse_reasoning else "content"
+        self._content_started = False
+
+    def _markers(self) -> list[str]:
+        if self._mode == "detect":
+            return [THINK_OPEN, *self.stop_strings]
+        if self._mode == "reasoning":
+            return [THINK_CLOSE, *self.stop_strings]
+        if self._mode == "content":
+            markers = list(self.stop_strings)
+            if self.parse_tool_calls:
+                markers.append(TOOL_OPEN)
+            return markers
+        return []
+
+    def push(self, delta: str) -> tuple[str, str]:
+        self.raw += delta
+        if self.stopped or self._mode == "swallow":
+            return "", ""
+        reasoning_out: list[str] = []
+        content_out: list[str] = []
+        buf = self._pending + delta
+        while buf and not self.stopped and self._mode != "swallow":
+            markers = self._markers()
+            index, marker = _find_first_marker(buf, markers) if markers else (-1, "")
+            if index < 0:
+                hold = _partial_tail_len(buf, markers) if markers else 0
+                if self._mode == "detect":
+                    # hold while the response head can still become "<think>"
+                    head = buf.lstrip()
+                    if not head or (
+                        len(head) < len(THINK_OPEN) and THINK_OPEN.startswith(head)
+                    ):
+                        break
+                    self._mode = "content"
+                    continue
+                emit, buf = buf[: len(buf) - hold], buf[len(buf) - hold :]
+                if emit:
+                    self._emit(emit, reasoning_out, content_out)
+                break
+            before, buf = buf[:index], buf[index + len(marker) :]
+            if before:
+                self._emit(before, reasoning_out, content_out)
+            if marker in self.stop_strings:
+                self.stopped = True
+                buf = ""
+                break
+            if marker == THINK_OPEN:
+                self._mode = "reasoning"
+            elif marker == THINK_CLOSE:
+                self._mode = "content"
+                buf = buf.lstrip("\n")
+            elif marker == TOOL_OPEN:
+                self._mode = "swallow"
+        self._pending = buf if not self.stopped else ""
+        return "".join(reasoning_out), "".join(content_out)
+
+    def _emit(self, text: str, reasoning_out: list[str], content_out: list[str]) -> None:
+        if self._mode == "swallow":
+            return
+        if self._mode == "reasoning":
+            self.reasoning += text
+            reasoning_out.append(text)
+            return
+        if not self._content_started:
+            text = text.lstrip("\n")
+            if not text:
+                return
+            self._content_started = True
+        self.content += text
+        content_out.append(text)
+
+    def flush(self) -> tuple[str, str]:
+        """Emit whatever was held back once generation is over."""
+        if self.stopped or self._mode == "swallow" or not self._pending:
+            self._pending = ""
+            return "", ""
+        pending, self._pending = self._pending, ""
+        if self._mode == "detect":
+            self._mode = "content"
+        reasoning_out: list[str] = []
+        content_out: list[str] = []
+        self._emit(pending, reasoning_out, content_out)
+        return "".join(reasoning_out), "".join(content_out)
+
+    def tool_calls(self) -> list[dict]:
+        if not self.parse_tool_calls or TOOL_OPEN not in self.raw:
+            return []
+        calls = []
+        for index, match in enumerate(TOOL_CALL_RE.finditer(self.raw)):
+            try:
+                payload = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                continue
+            name = payload.get("name")
+            if not isinstance(name, str):
+                continue
+            arguments = payload.get("arguments", {})
+            calls.append(
+                {
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "index": index,
+                    "function": {
+                        "name": name,
+                        "arguments": arguments
+                        if isinstance(arguments, str)
+                        else json.dumps(arguments, ensure_ascii=False),
+                    },
+                }
+            )
+        return calls
+
+
+# ---------------------------------------------------------------------------
+# engine
+# ---------------------------------------------------------------------------
+
+
+class BadRequest(Exception):
+    """400-level problem with the request payload."""
+
+
+class ServerBusy(Exception):
+    """The single generation slot could not be acquired in time."""
+
+
+class ClientDisconnected(Exception):
+    """The client went away mid-stream; abort generation."""
+
+
+@dataclass
+class GenerationResult:
+    content: str
+    reasoning: str
+    tool_calls: list[dict]
+    finish_reason: str
+    prompt_tokens: int
+    completion_tokens: int
+    prefill_seconds: float
+    decode_seconds: float
+
+    def metrics(self) -> dict:
+        prefill_tps = self.prompt_tokens / self.prefill_seconds if self.prefill_seconds > 0 else 0.0
+        decode_tps = (
+            self.completion_tokens / self.decode_seconds if self.decode_seconds > 0 else 0.0
+        )
+        return {
+            "prefill_seconds": round(self.prefill_seconds, 3),
+            "prefill_tokens_per_second": round(prefill_tps, 2),
+            "decode_seconds": round(self.decode_seconds, 3),
+            "decode_tokens_per_second": round(decode_tps, 2),
+        }
+
+
+class Engine:
+    """One resident model bundle, serialized generation."""
+
+    def __init__(
+        self,
+        bundle: ModelBundle,
+        *,
+        model_id: str,
+        prompt_builder: ChatPromptBuilder,
+        default_temperature: float = 0.0,
+        default_max_tokens: int = 512,
+        max_tokens_cap: int = 4096,
+        max_prompt_tokens: Optional[int] = None,
+        prefetch_temporal: bool = False,
+        parse_reasoning: bool = True,
+        parse_tool_calls: bool = True,
+        busy_timeout: float = 600.0,
+    ) -> None:
+        self.bundle = bundle
+        self.model_id = model_id
+        self.prompt_builder = prompt_builder
+        self.default_temperature = default_temperature
+        self.default_max_tokens = default_max_tokens
+        self.max_tokens_cap = max_tokens_cap
+        self.max_prompt_tokens = max_prompt_tokens or bundle.config.max_position_embeddings
+        self.prefetch_temporal = prefetch_temporal
+        self.parse_reasoning = parse_reasoning
+        self.parse_tool_calls = parse_tool_calls
+        self.busy_timeout = busy_timeout
+        self.created = int(time.time())
+        self._lock = threading.RLock()
+        self._depth = 0
+        self._requests = 0
+        self._busy = False
+
+    @contextmanager
+    def reserve(self) -> Iterator[None]:
+        """Hold the single generation slot; reentrant for the owning thread."""
+        if not self._lock.acquire(timeout=self.busy_timeout):
+            raise ServerBusy("server is busy generating another response")
+        self._depth += 1
+        self._busy = True
+        try:
+            yield
+        finally:
+            self._depth -= 1
+            self._busy = self._depth > 0
+            self._lock.release()
+
+    # -- introspection ------------------------------------------------
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    @property
+    def requests(self) -> int:
+        return self._requests
+
+    def count_tokens(self, text: str) -> int:
+        return len(self.bundle.tokenizer.encode(text).ids)
+
+    def status(self) -> dict:
+        config = self.bundle.config
+        status = {
+            "status": "ok",
+            "model": self.model_id,
+            "busy": self._busy,
+            "requests_served": self._requests,
+            "chat_template": self.prompt_builder.source,
+            "context_window": config.max_position_embeddings,
+            "layers": config.num_hidden_layers,
+            "experts_per_token": self.bundle.model.routed_top_k
+            if hasattr(self.bundle.model, "routed_top_k")
+            else config.num_experts_per_tok,
+            "expert_bits": self.bundle.expert_bits,
+            "slot_bank_size": self.bundle.slot_bank_size,
+        }
+        if self.bundle.slot_bank_size:
+            try:
+                stats = collect_slot_bank_stats(self.bundle.model)
+            except Exception:  # diagnostics must never break /health
+                stats = {}
+            if stats:
+                status["slot_bank"] = {
+                    "requests": int(stats.get("requests", 0)),
+                    "misses": int(stats.get("misses", 0)),
+                    "hit_rate": round(float(stats.get("hit_rate", 0.0)), 4),
+                }
+        return status
+
+    # -- generation ---------------------------------------------------
+
+    def resolve_max_tokens(self, requested: Optional[int]) -> int:
+        if requested is None:
+            requested = self.default_max_tokens
+        requested = int(requested)
+        if requested < 1:
+            raise BadRequest("'max_tokens' must be >= 1")
+        return min(requested, self.max_tokens_cap)
+
+    def resolve_temperature(self, requested: Optional[float]) -> float:
+        if requested is None:
+            return self.default_temperature
+        value = float(requested)
+        if value < 0.0:
+            raise BadRequest("'temperature' must be >= 0")
+        return value
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        temperature: float,
+        seed: Optional[int] = None,
+        stop: Sequence[str] = (),
+        on_delta: Optional[Callable[[str, str], None]] = None,
+    ) -> GenerationResult:
+        prompt_tokens = self.count_tokens(prompt)
+        if prompt_tokens == 0:
+            raise BadRequest("prompt is empty after tokenization")
+        if prompt_tokens > self.max_prompt_tokens:
+            raise BadRequest(
+                f"prompt is {prompt_tokens} tokens, limit is {self.max_prompt_tokens}"
+            )
+
+        assembler = ResponseAssembler(
+            stop_strings=[*stop, *IMPLICIT_STOPS],
+            parse_reasoning=self.parse_reasoning,
+            parse_tool_calls=self.parse_tool_calls,
+        )
+        token_ids: list[int] = []
+        emitted = ""
+        first_token_at: Optional[float] = None
+
+        class _Stop(Exception):
+            pass
+
+        def handle_token(token_id: int) -> None:
+            nonlocal emitted, first_token_at
+            if first_token_at is None:
+                first_token_at = time.perf_counter()
+            token_ids.append(token_id)
+            decoded = decode_incremental(self.bundle.tokenizer, token_ids)
+            delta = decoded[len(emitted) :]
+            emitted = decoded
+            if not delta:
+                return
+            reasoning_delta, content_delta = assembler.push(delta)
+            if on_delta is not None and (reasoning_delta or content_delta):
+                on_delta(reasoning_delta, content_delta)
+            if assembler.stopped:
+                raise _Stop()
+
+        with self.reserve():
+            started = time.perf_counter()
+            try:
+                stats = generate_with_stats(
+                    self.bundle,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    seed=seed,
+                    on_token=handle_token,
+                    slot_bank_temporal_prefetch=self.prefetch_temporal,
+                )
+            except _Stop:
+                # A stop string cut generation short, so the runtime never got
+                # to return its own stats; time it from here instead.
+                now = time.perf_counter()
+                stats = GenerationStats(
+                    prompt_tokens=prompt_tokens,
+                    generated_tokens=len(token_ids),
+                    prefill_seconds=(first_token_at or now) - started,
+                    decode_seconds=now - (first_token_at or now),
+                )
+            self._requests += 1
+
+        reasoning_delta, content_delta = assembler.flush()
+        if on_delta is not None and (reasoning_delta or content_delta):
+            on_delta(reasoning_delta, content_delta)
+
+        tool_calls = assembler.tool_calls()
+        if tool_calls:
+            finish_reason = "tool_calls"
+        elif not assembler.stopped and stats.generated_tokens >= max_tokens:
+            finish_reason = "length"
+        else:
+            finish_reason = "stop"
+        return GenerationResult(
+            content=assembler.content,
+            reasoning=assembler.reasoning,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            prompt_tokens=stats.prompt_tokens or prompt_tokens,
+            completion_tokens=len(token_ids),
+            prefill_seconds=stats.prefill_seconds,
+            decode_seconds=stats.decode_seconds,
+        )
+
+
+# ---------------------------------------------------------------------------
+# HTTP layer
+# ---------------------------------------------------------------------------
+
+
+IGNORED_PARAMS = (
+    "top_p",
+    "top_k",
+    "presence_penalty",
+    "frequency_penalty",
+    "repetition_penalty",
+    "logit_bias",
+    "logprobs",
+    "response_format",
+    "min_p",
+)
+
+
+def _parse_stop(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return list(value)
+    raise BadRequest("'stop' must be a string or a list of strings")
+
+
+def _common_params(payload: dict, engine: Engine) -> dict:
+    if payload.get("n") not in (None, 1):
+        raise BadRequest("'n' > 1 is not supported")
+    max_tokens = payload.get("max_tokens")
+    if max_tokens is None:
+        max_tokens = payload.get("max_completion_tokens")
+    stream_options = payload.get("stream_options") or {}
+    return {
+        "max_tokens": engine.resolve_max_tokens(max_tokens),
+        "temperature": engine.resolve_temperature(payload.get("temperature")),
+        "seed": int(payload["seed"]) if payload.get("seed") is not None else None,
+        "stop": _parse_stop(payload.get("stop")),
+        "stream": bool(payload.get("stream", False)),
+        "include_usage": bool(stream_options.get("include_usage", False)),
+        "model": str(payload.get("model") or engine.model_id),
+        "extra_ignored": [key for key in IGNORED_PARAMS if payload.get(key) is not None],
+    }
+
+
+def _usage(result: GenerationResult) -> dict:
+    return {
+        "prompt_tokens": result.prompt_tokens,
+        "completion_tokens": result.completion_tokens,
+        "total_tokens": result.prompt_tokens + result.completion_tokens,
+    }
+
+
+class _Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "flash-moe-mlx"
+    sys_version = ""
+
+    # -- plumbing -----------------------------------------------------
+
+    @property
+    def engine(self) -> Engine:
+        return self.server.engine  # type: ignore[attr-defined]
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        if getattr(self.server, "verbose", False):
+            _log(f"{self.address_string()} {fmt % args}")
+
+    def _cors_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+
+    def _send_json(self, payload: dict, status: int = 200) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_error_json(self, status: int, message: str, error_type: str = "invalid_request_error") -> None:
+        self._send_json(
+            {"error": {"message": message, "type": error_type, "param": None, "code": None}},
+            status=status,
+        )
+
+    def _read_json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            raise BadRequest("request body is empty")
+        if length > MAX_BODY_BYTES:
+            raise BadRequest("request body is too large")
+        raw = self.rfile.read(length)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BadRequest(f"invalid JSON body: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise BadRequest("request body must be a JSON object")
+        return payload
+
+    def _authorized(self) -> bool:
+        expected = getattr(self.server, "api_key", None)
+        if not expected:
+            return True
+        header = self.headers.get("Authorization", "")
+        token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        return token == expected
+
+    # -- SSE ----------------------------------------------------------
+
+    def _begin_stream(self) -> None:
+        self._stream_started = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Transfer-Encoding", "chunked")
+        self._cors_headers()
+        self.end_headers()
+
+    def _write_chunk(self, text: str) -> None:
+        data = text.encode("utf-8")
+        try:
+            self.wfile.write(f"{len(data):x}\r\n".encode("ascii") + data + b"\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            raise ClientDisconnected() from exc
+
+    def _write_event(self, payload: dict) -> None:
+        self._write_chunk(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n")
+
+    def _end_stream(self) -> None:
+        try:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    # -- routing ------------------------------------------------------
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self._cors_headers()
+        self.end_headers()
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path in ("/health", "/v1/health"):
+            self._send_json(self.engine.status())
+            return
+        if not self._authorized():
+            self._send_error_json(401, "invalid API key", "authentication_error")
+            return
+        if path in ("/v1/models", "/models"):
+            self._send_json({"object": "list", "data": [self._model_card()]})
+            return
+        if path.startswith("/v1/models/") or path.startswith("/models/"):
+            self._send_json(self._model_card())
+            return
+        if path == "/":
+            self._send_json(
+                {
+                    "service": "anemll-flash-mlx",
+                    "model": self.engine.model_id,
+                    "endpoints": [
+                        "/v1/models",
+                        "/v1/chat/completions",
+                        "/v1/completions",
+                        "/health",
+                    ],
+                }
+            )
+            return
+        self._send_error_json(404, f"unknown path {path}", "not_found_error")
+
+    def do_POST(self) -> None:  # noqa: N802
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        self._stream_started = False
+        if not self._authorized():
+            self._send_error_json(401, "invalid API key", "authentication_error")
+            return
+        try:
+            if path in ("/v1/chat/completions", "/chat/completions"):
+                self._handle_completions(chat=True)
+            elif path in ("/v1/completions", "/completions"):
+                self._handle_completions(chat=False)
+            else:
+                self._send_error_json(404, f"unknown path {path}", "not_found_error")
+        except BadRequest as exc:
+            self._fail(400, str(exc), "invalid_request_error")
+        except ServerBusy as exc:
+            self._fail(503, str(exc), "server_error")
+        except ClientDisconnected:
+            _log("client disconnected, generation aborted")
+            self.close_connection = True
+        except Exception as exc:  # keep the server alive on runtime errors
+            _log(f"error: {type(exc).__name__}: {exc}")
+            self._fail(500, f"{type(exc).__name__}: {exc}", "server_error")
+
+    def _fail(self, status: int, message: str, error_type: str) -> None:
+        """Report an error, whether or not the SSE stream already started."""
+        try:
+            if self._stream_started:
+                self._write_event({"error": {"message": message, "type": error_type}})
+                self._write_chunk("data: [DONE]\n\n")
+                self._end_stream()
+            else:
+                self._send_error_json(status, message, error_type)
+        except (ClientDisconnected, BrokenPipeError, ConnectionResetError, OSError):
+            self.close_connection = True
+
+    def _model_card(self) -> dict:
+        return {
+            "id": self.engine.model_id,
+            "object": "model",
+            "created": self.engine.created,
+            "owned_by": "anemll-flash-mlx",
+        }
+
+    # -- completions --------------------------------------------------
+
+    def _handle_completions(self, chat: bool) -> None:
+        payload = self._read_json_body()
+        params = _common_params(payload, self.engine)
+        if chat:
+            messages = payload.get("messages")
+            if not isinstance(messages, list) or not messages:
+                raise BadRequest("'messages' must be a non-empty list")
+            prompt = self.engine.prompt_builder.render(messages, payload.get("tools"))
+        else:
+            raw_prompt = payload.get("prompt")
+            if isinstance(raw_prompt, list):
+                if len(raw_prompt) != 1 or not isinstance(raw_prompt[0], str):
+                    raise BadRequest("'prompt' must be a string or a single-element list")
+                raw_prompt = raw_prompt[0]
+            if not isinstance(raw_prompt, str) or not raw_prompt:
+                raise BadRequest("'prompt' must be a non-empty string")
+            prompt = raw_prompt
+        if params["extra_ignored"]:
+            _log(f"ignoring unsupported params: {', '.join(params['extra_ignored'])}")
+
+        request_id = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex
+        created = int(time.time())
+        if params["stream"]:
+            self._stream_completion(chat, prompt, params, request_id, created)
+        else:
+            self._blocking_completion(chat, prompt, params, request_id, created)
+
+    def _blocking_completion(
+        self, chat: bool, prompt: str, params: dict, request_id: str, created: int
+    ) -> None:
+        result = self.engine.generate(
+            prompt,
+            max_tokens=params["max_tokens"],
+            temperature=params["temperature"],
+            seed=params["seed"],
+            stop=params["stop"],
+        )
+        if chat:
+            message: dict[str, Any] = {"role": "assistant", "content": result.content}
+            if result.reasoning:
+                message["reasoning_content"] = result.reasoning
+            if result.tool_calls:
+                message["tool_calls"] = result.tool_calls
+            choice = {"index": 0, "message": message, "finish_reason": result.finish_reason}
+            obj = "chat.completion"
+        else:
+            choice = {
+                "index": 0,
+                "text": result.content,
+                "logprobs": None,
+                "finish_reason": result.finish_reason,
+            }
+            obj = "text_completion"
+        self._send_json(
+            {
+                "id": request_id,
+                "object": obj,
+                "created": created,
+                "model": params["model"],
+                "choices": [choice],
+                "usage": _usage(result),
+                "x_flash_moe": result.metrics(),
+            }
+        )
+        self._log_result(result)
+
+    def _stream_completion(
+        self, chat: bool, prompt: str, params: dict, request_id: str, created: int
+    ) -> None:
+        obj = "chat.completion.chunk" if chat else "text_completion"
+
+        def envelope(choice: dict, usage: Optional[dict] = None) -> dict:
+            payload = {
+                "id": request_id,
+                "object": obj,
+                "created": created,
+                "model": params["model"],
+                "choices": [choice],
+            }
+            if usage is not None:
+                payload["usage"] = usage
+            return payload
+
+        def on_delta(reasoning_delta: str, content_delta: str) -> None:
+            if chat:
+                delta: dict[str, Any] = {}
+                if reasoning_delta:
+                    delta["reasoning_content"] = reasoning_delta
+                if content_delta:
+                    delta["content"] = content_delta
+                if delta:
+                    self._write_event(envelope({"index": 0, "delta": delta, "finish_reason": None}))
+            elif content_delta:
+                self._write_event(
+                    envelope(
+                        {"index": 0, "text": content_delta, "logprobs": None, "finish_reason": None}
+                    )
+                )
+
+        # Take the generation slot before the first byte goes out, so a busy
+        # server answers with a real 503 instead of a stalled 200.
+        with self.engine.reserve():
+            self._begin_stream()
+            if chat:
+                self._write_event(
+                    envelope({"index": 0, "delta": {"role": "assistant"}, "finish_reason": None})
+                )
+            result = self.engine.generate(
+                prompt,
+                max_tokens=params["max_tokens"],
+                temperature=params["temperature"],
+                seed=params["seed"],
+                stop=params["stop"],
+                on_delta=on_delta,
+            )
+        if chat:
+            final_delta: dict[str, Any] = {}
+            if result.tool_calls:
+                final_delta["tool_calls"] = result.tool_calls
+            final_choice = {"index": 0, "delta": final_delta, "finish_reason": result.finish_reason}
+        else:
+            final_choice = {
+                "index": 0,
+                "text": "",
+                "logprobs": None,
+                "finish_reason": result.finish_reason,
+            }
+        self._write_event(envelope(final_choice))
+        if params["include_usage"]:
+            self._write_event(
+                {
+                    "id": request_id,
+                    "object": obj,
+                    "created": created,
+                    "model": params["model"],
+                    "choices": [],
+                    "usage": _usage(result),
+                    "x_flash_moe": result.metrics(),
+                }
+            )
+        self._write_chunk("data: [DONE]\n\n")
+        self._end_stream()
+        self._log_result(result)
+
+    def _log_result(self, result: GenerationResult) -> None:
+        metrics = result.metrics()
+        _log(
+            f"prompt_tokens={result.prompt_tokens} "
+            f"completion_tokens={result.completion_tokens} "
+            f"prefill_tps={metrics['prefill_tokens_per_second']:.2f} "
+            f"decode_tps={metrics['decode_tokens_per_second']:.2f} "
+            f"finish={result.finish_reason}"
+        )
+
+
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, address, engine: Engine, api_key: Optional[str], verbose: bool) -> None:
+        super().__init__(address, _Handler)
+        self.engine = engine
+        self.api_key = api_key
+        self.verbose = verbose
+
+    def handle_error(self, request, client_address) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return  # client hung up, nothing to report
+        super().handle_error(request, client_address)
+
+
+def serve(engine: Engine, host: str, port: int, api_key: Optional[str] = None, verbose: bool = False) -> None:
+    server = _Server((host, port), engine, api_key, verbose)
+    shown_host = host if host not in ("0.0.0.0", "::") else "127.0.0.1"
+    _log(f"listening on http://{shown_host}:{port}/v1  (model id: {engine.model_id})")
+    _log(f"api key: {'required' if api_key else 'not required'}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        _log("shutting down")
+    finally:
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="OpenAI-compatible server for the 35B MLX dense path with native streamed experts",
+    )
+    model = parser.add_argument_group("model loading (same flags as run_qwen35.py)")
+    model.add_argument("--mlx", required=True, help="Path to the raw MLX model directory")
+    model.add_argument("--experts", help="Path to the packed_experts directory")
+    model.add_argument(
+        "--2-bit",
+        "--2bit",
+        dest="expert_bits_2",
+        action="store_true",
+        help="Interpret external packed experts as 2-bit affine experts",
+    )
+    model.add_argument(
+        "--resident",
+        action="store_true",
+        help="Load routed experts from the MLX checkpoint instead of packed_experts",
+    )
+    model.add_argument(
+        "--resident-flash",
+        action="store_true",
+        help="Preload packed_experts into RAM and serve routed experts from memory instead of SSD",
+    )
+    model.add_argument(
+        "--resident-pread-mlx",
+        "--resident-pread",
+        "--resident-bank-index",
+        dest="resident_pread_mlx",
+        action="store_true",
+        help="pread packed_experts once at startup into a persistent full MLX expert bank",
+    )
+    model.add_argument(
+        "--resident-rebind",
+        action="store_true",
+        help="pread packed_experts once at startup, then rebind the selected K expert tensors each token",
+    )
+    model.add_argument(
+        "--resident-copy-k",
+        action="store_true",
+        help="pread packed_experts once at startup, then copy the selected K experts into stable buffers each token",
+    )
+    model.add_argument(
+        "--slot-bank",
+        type=int,
+        default=0,
+        help="Keep a stable per-layer expert slot bank of this size and reload only misses",
+    )
+    model.add_argument(
+        "--slot-bank-native",
+        action="store_true",
+        help="Use native C slot ownership/victim selection for --slot-bank",
+    )
+    model.add_argument(
+        "--prefetch-temporal",
+        action="store_true",
+        help="After each token, prefetch the same routed experts into the next slot-bank step",
+    )
+    model.add_argument(
+        "--compiled-tail",
+        action="store_true",
+        help="Compile the final sparse-block shared-expert tail",
+    )
+    model.add_argument(
+        "--k",
+        type=int,
+        default=None,
+        help="Override routed experts per token (1..model config num_experts_per_tok)",
+    )
+    model.add_argument(
+        "--cache-io-split",
+        type=int,
+        default=1,
+        help="Split each routed expert pread into N page-aligned chunks",
+    )
+
+    server = parser.add_argument_group("server")
+    server.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    server.add_argument("--port", type=int, default=8080, help="Bind port (default: 8080)")
+    server.add_argument(
+        "--served-model-name",
+        help="Model id reported by /v1/models (default: the --mlx directory name)",
+    )
+    server.add_argument(
+        "--api-key",
+        default=os.environ.get("FLASH_MOE_API_KEY"),
+        help="Require this bearer token (default: $FLASH_MOE_API_KEY, or no auth)",
+    )
+    server.add_argument(
+        "--default-max-tokens",
+        type=int,
+        default=512,
+        help="max_tokens used when a request does not set one (default: 512)",
+    )
+    server.add_argument(
+        "--max-tokens-cap",
+        type=int,
+        default=4096,
+        help="Upper bound applied to any requested max_tokens (default: 4096)",
+    )
+    server.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        default=None,
+        help="Reject prompts longer than this (default: the model context window)",
+    )
+    server.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Temperature used when a request does not set one (default: 0, greedy)",
+    )
+    server.add_argument(
+        "--busy-timeout",
+        type=float,
+        default=600.0,
+        help="Seconds a request waits for the generation slot before 503 (default: 600)",
+    )
+    server.add_argument(
+        "--no-reasoning",
+        action="store_true",
+        help="Keep <think> blocks inline in content instead of splitting them into reasoning_content",
+    )
+    server.add_argument(
+        "--no-tool-calls",
+        action="store_true",
+        help="Do not parse <tool_call> blocks into OpenAI tool_calls",
+    )
+    server.add_argument(
+        "--enable-thinking",
+        dest="enable_thinking",
+        action="store_true",
+        default=None,
+        help="Pass enable_thinking=true to the checkpoint chat template",
+    )
+    server.add_argument(
+        "--disable-thinking",
+        dest="enable_thinking",
+        action="store_false",
+        help="Pass enable_thinking=false to the checkpoint chat template",
+    )
+    server.add_argument("--no-warmup", action="store_true", help="Skip the one-token warmup pass")
+    server.add_argument("--verbose", action="store_true", help="Log every HTTP request")
+    return parser
+
+
+def main() -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    resident_modes = sum(
+        (
+            args.resident,
+            args.resident_flash,
+            args.resident_pread_mlx,
+            args.resident_rebind,
+            args.resident_copy_k,
+        )
+    )
+    if resident_modes > 1:
+        parser.error(
+            "--resident, --resident-flash, --resident-pread-mlx, --resident-rebind, and --resident-copy-k are mutually exclusive"
+        )
+    if args.prefetch_temporal and not args.slot_bank:
+        parser.error("--prefetch-temporal currently requires --slot-bank")
+    if not args.resident and not args.experts:
+        parser.error("--experts is required unless --resident is set")
+
+    bundle = load_model_bundle(
+        mlx_model_dir=args.mlx,
+        experts_dir=args.experts,
+        routed_top_k=args.k,
+        cache_io_split=args.cache_io_split,
+        expert_bits=2 if args.expert_bits_2 else None,
+        resident_experts=args.resident,
+        resident_flash=args.resident_flash,
+        resident_pread_mlx=args.resident_pread_mlx,
+        resident_rebind=args.resident_rebind,
+        resident_copy_k=args.resident_copy_k,
+        slot_bank_size=args.slot_bank,
+        slot_bank_native=args.slot_bank_native,
+    )
+    if args.compiled_tail:
+        set_sparse_moe_tail_compile(bundle.model, True)
+
+    model_dir = Path(args.mlx)
+    model_id = args.served_model_name or model_dir.name
+    prompt_builder = ChatPromptBuilder(model_dir, enable_thinking=args.enable_thinking)
+    engine = Engine(
+        bundle,
+        model_id=model_id,
+        prompt_builder=prompt_builder,
+        default_temperature=args.temperature,
+        default_max_tokens=args.default_max_tokens,
+        max_tokens_cap=args.max_tokens_cap,
+        max_prompt_tokens=args.max_prompt_tokens,
+        prefetch_temporal=args.prefetch_temporal,
+        parse_reasoning=not args.no_reasoning,
+        parse_tool_calls=not args.no_tool_calls,
+        busy_timeout=args.busy_timeout,
+    )
+    _log(
+        f"loaded model={args.mlx} "
+        f"layers={bundle.config.num_hidden_layers} "
+        f"k={args.k or bundle.config.num_experts_per_tok} "
+        f"expert_size={bundle.expert_geometry.expert_size} bytes "
+        f"chat_template={prompt_builder.source}"
+    )
+    if not args.no_warmup:
+        started = time.perf_counter()
+        engine.generate("Hi", max_tokens=1, temperature=0.0, seed=0)
+        _log(f"warmup done in {time.perf_counter() - started:.2f}s")
+    serve(engine, args.host, args.port, api_key=args.api_key, verbose=args.verbose)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
