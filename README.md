@@ -15,7 +15,7 @@ hfcache=$(hf env | grep -i cache|grep HF_HUB_CACHE|awk '{print $NF}')
 
 hf download unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit
 ```
-### extract and pack experts
+### Extract and pack experts
 ```
 python3 scripts/export_mixed_sidecar.py \
   --model $hfcache/mlx-Qwen3.5-35B-A3B-4bit \
