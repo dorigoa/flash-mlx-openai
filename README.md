@@ -1,6 +1,5 @@
 # flash-mlx-openai
-This is a fork from `anemll-flash-mlx` with the addition of a OpenAI compatible WEB server that allows the Qwen3.6 model to be used from remote (e.g. from an agent like claude code).
-
+This is a fork of anemll-flash-mlx with the addition of an OpenAI-compatible web server that allows you to use the Qwen3.6 model remotely (for example, through an agent like Claude Code).
 # anemll-flash-mlx
 
 
