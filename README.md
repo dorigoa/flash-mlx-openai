@@ -17,15 +17,15 @@ hf download unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit
 ```
 ### Extract and pack experts
 ```
-model=Qwen3.6-35B-A3B-OptiQ-4bit
+model=Qwen3.6-35B-A3B-OptiQ-4bit # change with a different flavour of qwen3.6-35b-a3b (4bit)
 configdir=$(dirname $(find $hfcache/$model -iname config.json))
 python3 scripts/export_mixed_sidecar.py --model $cofigdir --output $hfcache/packed_experts/$model
 ```
 ### Run model
 ```
 python3 scripts/run_qwen35.py \
-  --mlx $hfcache/mlx-Qwen3.5-35B-A3B-4bit \
-  --experts $hfcache/packed_experts/mlx-Qwen3.5-35B-A3B-4bit \
+  --mlx $configdir \
+  --experts $hfcache/packed_experts/$model \
   --max-tokens 1000 --k 4 --temperature 0 \
   --slot-bank 128 --slot-bank-native --prefetch-temporal \
   --cache-io-split 4 --stream \
