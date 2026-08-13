@@ -17,9 +17,10 @@ hf download unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit
 ```
 ### Extract and pack experts
 ```
+model=Qwen3.6-35B-A3B-OptiQ-4bit
 python3 scripts/export_mixed_sidecar.py \
-  --model $hfcache/mlx-Qwen3.5-35B-A3B-4bit \
-  --output $hfcache/packed_experts/mlx-Qwen3.5-35B-A3B-4bit
+  --model $hfcache/$model \
+  --output $hfcache/packed_experts/$model
 ```
 ### Run model
 ```
