@@ -1,5 +1,37 @@
 # flash-mlx-openai
 This is a fork of anemll-flash-mlx with the addition of an OpenAI-compatible web server that allows you to use the Qwen3.6 model remotely (for example, through an agent like Claude Code).
+
+## Quickstart
+```
+git clone git@github.com:dorigoa/flash-mlx-openai.git
+cd flash-mlx-openai
+uv sync
+source .venv/bin/activate
+uv pip install -e .
+uv sync --extra export
+make smoke # must answer: 'import-ok'
+
+hfcache=$(hf env | grep -i cache|grep HF_HUB_CACHE|awk '{print $NF}')
+
+hf download unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit
+```
+### extract and pack experts
+```
+python3 scripts/export_mixed_sidecar.py \
+  --model $hfcache/mlx-Qwen3.5-35B-A3B-4bit \
+  --output $hfcache/packed_experts/mlx-Qwen3.5-35B-A3B-4bit
+```
+### Run model
+```
+python3 scripts/run_qwen35.py \
+  --mlx $hfcache/mlx-Qwen3.5-35B-A3B-4bit \
+  --experts $hfcache/packed_experts/mlx-Qwen3.5-35B-A3B-4bit \
+  --max-tokens 1000 --k 4 --temperature 0 \
+  --slot-bank 128 --slot-bank-native --prefetch-temporal \
+  --cache-io-split 4 --stream \
+  --prompt "Write a python function that implement a string quicksort."
+```
+
 # anemll-flash-mlx
 
 
