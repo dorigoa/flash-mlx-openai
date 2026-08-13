@@ -15,13 +15,16 @@ make smoke # must answer: 'import-ok'
 
 hfcache=$(hf env | grep -i cache|grep HF_HUB_CACHE|awk '{print $NF}')
 
+# To get max performances the hf_cache must be on the fastest local device
 hf download unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit
 ```
 ### Extract and pack experts
 ```
 model=Qwen3.6-35B-A3B-OptiQ-4bit # change with a different flavour of qwen3.6-35b-a3b (4bit)
 configdir=$(dirname $(find $hfcache/$model -iname config.json))
-python3 scripts/export_mixed_sidecar.py --model $cofigdir --output $hfcache/packed_experts/$model
+# Choose an output dir which is on a fast device
+outputdir=/Users/packed_experts
+python3 scripts/export_mixed_sidecar.py --model $cofigdir --output $outputdir/$model
 ```
 ### Run model
 ```
