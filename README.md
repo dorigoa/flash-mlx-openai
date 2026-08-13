@@ -1,6 +1,8 @@
 # flash-mlx-openai
 This is a fork of anemll-flash-mlx with the addition of an OpenAI-compatible web server that allows you to use the Qwen3.6 model remotely (for example, through an agent like Claude Code).
 
+Basically this code allows to fit large MoE model Qwen3.6-35B-A3B (4bit quantisation) into memory by loading only the dense part of the model, and streaming from local storage (NVMe, otherwise it is unusable) the experts.
+
 ## Quickstart
 ```
 git clone git@github.com:dorigoa/flash-mlx-openai.git
