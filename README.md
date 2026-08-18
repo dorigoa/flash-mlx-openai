@@ -21,7 +21,7 @@ hf download $provider/$model
 ```
 ### Extract and pack experts
 ```
-configdir=$(dirname $(find $hfcache/$model -iname config.json))
+configdir=$(dirname $(find $hfcache/models--$provider--$model -iname config.json))
 # Choose an output dir which is on a fast device
 outputdir=/Users/packed_experts
 python3 scripts/export_mixed_sidecar.py --model $cofigdir --output $outputdir/$model
