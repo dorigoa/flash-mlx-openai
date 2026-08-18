@@ -23,16 +23,17 @@ hf download $provider/$model
 ```
 configdir=$(dirname $(find $hfcache/models--$provider--$model -iname config.json))
 # Choose an output dir which is on a fast device
-outputdir=/Users/packed_experts
+outputdir=/Users/packed_experts # choose this path on a fast NVMe
 python3 scripts/export_mixed_sidecar.py --model $cofigdir --output $outputdir/$model
 ```
 ### Run model
 ```
 python3 scripts/run_qwen35.py \
   --mlx $configdir \
-  --experts $hfcache/packed_experts/$model \
+  --experts $outputdir/$model \
   --max-tokens 1000 --k 4 --temperature 0 \
-  --slot-bank 128 --slot-bank-native --prefetch-temporal \
+  --slot-bank 32 \ # 32 seems a sweet point on a M4 16GB, with more RAM it can be inreased
+  --slot-bank-native --prefetch-temporal \
   --cache-io-split 4 --stream \
   --prompt "Write a python function that implement a string quicksort."
 ```
